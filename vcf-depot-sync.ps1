@@ -3,7 +3,7 @@
 Script Name: vcf-depot-sync.ps1
 Platform:    Windows Server (PowerShell 5.1 / PowerShell 7+)
 Purpose:     Automated weekly synchronization of VMware Cloud Foundation (VCF) 
-             9.1.x base install binaries, maintenance/express patches, ESXi 9.1 
+             9.1.x+ base install binaries, maintenance/express patches, ESXi 9.1 
              x86_64 host updates, and certified OEM vendor add-ons for air-gapped 
              offline depots with vSphere Lifecycle Manager (vLCM) shared repository 
              support.
@@ -20,7 +20,11 @@ param(
     [Parameter(Mandatory = $false)]
     [string]$AuthFile = "E:\VCF\activation-code.txt",
 
-    # Regex pattern to match all active 9.1.x releases automatically
+    # Minimum VCF version to sync (prevents downloading obsolete older releases like 9.1.0.0)
+    [Parameter(Mandatory = $false)]
+    [string]$MinVcfVersion = "9.1.1.0",
+
+    # Upper major version boundary regex (keeps sync constrained to 9.1.x family)
     [Parameter(Mandatory = $false)]
     [string]$VersionPattern = '^9\.1\.',
 
@@ -115,13 +119,19 @@ Write-Log "Storage pre-check passed. Available space on ${DepotDrive}: ${FreeGB}
 function Invoke-ToolCommand {
     param (
         [string]$Description,
-        [string[]]$Arguments
+        [string[]]$Arguments,
+        [bool]$IgnoreFailure = $false
     )
     Write-Log $Description
     & $VcfdtBin $Arguments *>> $LogFile
     if ($LASTEXITCODE -ne 0) {
-        Write-Log "Command failed with exit code ${LASTEXITCODE}: $VcfdtBin $($Arguments -join ' ')" -Severity "ERROR"
-        return $false
+        if ($IgnoreFailure) {
+            Write-Log "Notice: Optional command completed with non-zero exit code ${LASTEXITCODE} (may indicate no packages of this type exist): $VcfdtBin $($Arguments -join ' ')" -Severity "WARNING"
+            return $true
+        } else {
+            Write-Log "Command failed with exit code ${LASTEXITCODE}: $VcfdtBin $($Arguments -join ' ')" -Severity "ERROR"
+            return $false
+        }
     }
     return $true
 }
@@ -163,26 +173,45 @@ if (-not $MetaSuccess) {
 }
 
 # ------------------------------------------------------------------------------
-# 4. DYNAMIC VERSION DISCOVERY (9.1.x RELEASES)
+# 4. RESILIENT DYNAMIC VERSION DISCOVERY (>= MinVcfVersion)
 # ------------------------------------------------------------------------------
 $ManifestPath = Join-Path -Path $DepotStore -ChildPath "PROD\metadata\manifest\v1\vcfManifest.json"
 $DiscoveredVersions = @()
 
 if (Test-Path -Path $ManifestPath) {
     try {
-        $ManifestJson = Get-Content -Path $ManifestPath -Raw | ConvertFrom-Json
-        $DiscoveredVersions = $ManifestJson.releases | 
-            Where-Object { $_.version -match $VersionPattern } | 
-            ForEach-Object { $_.version } | 
-            Sort-Object -Unique
+        $ManifestRaw = Get-Content -Path $ManifestPath -Raw
+        $ManifestJson = $ManifestRaw | ConvertFrom-Json
+        
+        # Primary check: .releases property
+        $CandidateReleases = if ($ManifestJson.releases) { $ManifestJson.releases } 
+                             elseif ($ManifestJson.vcfReleases) { $ManifestJson.vcfReleases } 
+                             else { @() }
 
-        Write-Log "Dynamically discovered VCF releases from manifest: $($DiscoveredVersions -join ', ')"
+        if ($CandidateReleases.Count -gt 0) {
+            $DiscoveredVersions = $CandidateReleases | 
+                Where-Object { 
+                    $_.version -match $VersionPattern -and 
+                    ([version]$_.version -ge [version]$MinVcfVersion) 
+                } | 
+                ForEach-Object { $_.version } | 
+                Sort-Object -Unique
+        } else {
+            # Regex extraction fallback directly from raw JSON
+            $Matches = [regex]::Matches($ManifestRaw, '"version"\s*:\s*"(9\.1\.\d+\.\d+)"')
+            $DiscoveredVersions = $Matches | 
+                ForEach-Object { $_.Groups[1].Value } | 
+                Where-Object { [version]$_ -ge [version]$MinVcfVersion } | 
+                Sort-Object -Unique
+        }
+
+        Write-Log "Dynamically discovered active VCF releases: $($DiscoveredVersions -join ', ')"
     } catch {
-        Write-Log "Warning: Could not parse manifest file: $_. Falling back to default list." -Severity "WARNING"
+        Write-Log "Warning: Manifest parsing exception: $_. Falling back to default list." -Severity "WARNING"
     }
 }
 
-# Fallback safety list if manifest parsing is unavailable
+# Fallback safety list
 if ($DiscoveredVersions.Count -eq 0) {
     $DiscoveredVersions = @("9.1.1.0", "9.1.2.0")
     Write-Log "Using fallback version list: $($DiscoveredVersions -join ', ')" -Severity "WARNING"
@@ -192,16 +221,12 @@ if ($DiscoveredVersions.Count -eq 0) {
 # 5. DOWNLOAD BINARIES FOR ALL DISCOVERED RELEASES
 # ------------------------------------------------------------------------------
 foreach ($Ver in $DiscoveredVersions) {
-    # 5a. Base Install Bundles (GA baseline release)
-    $BaseSuccess = Invoke-ToolCommand -Description "[3/6] Downloading VCF $Ver base install bundles (GA baseline)..." `
-        -Arguments @("binaries", "download", "--sku", $Sku, "--vcf-version", $Ver, "--type", "INSTALL", "--depot-download-activation-code-file", $AuthFile, "--depot-store", $DepotStore)
-    if (-not $BaseSuccess) {
-        Write-Log "VCF $Ver base install binaries download encountered errors. Review log above." -Severity "ERROR"
-        $LockStream.Close()
-        exit 1
-    }
+    # 5a. Base Install Bundles (Tolerates releases that only provide UPGRADE packages)
+    Invoke-ToolCommand -Description "[3/6] Downloading VCF $Ver base install bundles (GA baseline if available)..." `
+        -Arguments @("binaries", "download", "--sku", $Sku, "--vcf-version", $Ver, "--type", "INSTALL", "--depot-download-activation-code-file", $AuthFile, "--depot-store", $DepotStore) `
+        -IgnoreFailure $true
 
-    # 5b. Upgrade and Express Patch Bundles
+    # 5b. Upgrade and Express Patch Bundles (Mandatory)
     $PatchSuccess = Invoke-ToolCommand -Description "[4/6] Downloading VCF $Ver component upgrade and patch bundles..." `
         -Arguments @("binaries", "download", "--sku", $Sku, "--vcf-version", $Ver, "--type", "UPGRADE", "--depot-download-activation-code-file", $AuthFile, "--depot-store", $DepotStore)
     if (-not $PatchSuccess) {
