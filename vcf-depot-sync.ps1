@@ -3,7 +3,7 @@
 Script Name: vcf-depot-sync.ps1
 Platform:    Windows Server (PowerShell 5.1 / PowerShell 7+)
 Purpose:     Automated weekly synchronization of VMware Cloud Foundation (VCF) 
-             9.1.x+ base install binaries, maintenance/express patches, ESXi 9.1 
+             9.1.x base install binaries, maintenance/express patches, ESXi 9.1 
              x86_64 host updates, and certified OEM vendor add-ons for air-gapped 
              offline depots with vSphere Lifecycle Manager (vLCM) shared repository 
              support.
@@ -30,6 +30,10 @@ param(
 
     [Parameter(Mandatory = $false)]
     [string]$Sku = "VCF",
+
+    # Configures CEIP non-interactively to prevent interactive terminal prompt hangs
+    [Parameter(Mandatory = $false)]
+    [bool]$EnableCeip = $false,
 
     [Parameter(Mandatory = $false)]
     [int]$MinFreeSpaceGB = 50,
@@ -137,8 +141,17 @@ function Invoke-ToolCommand {
 }
 
 # ------------------------------------------------------------------------------
-# 2. ESXi PLATFORM FILTERING & DEPOT CLEANUP
+# 2. NON-INTERACTIVE CEIP & ESXi PLATFORM CONFIGURATION
 # ------------------------------------------------------------------------------
+# Configure CEIP non-interactively to suppress interactive console prompt stalls
+if ($EnableCeip) {
+    Write-Log "Configuring Customer Experience Improvement Program (CEIP): Enabled"
+    & $VcfdtBin ceip enable *>> $LogFile
+} else {
+    Write-Log "Configuring Customer Experience Improvement Program (CEIP): Disabled"
+    & $VcfdtBin ceip disable *>> $LogFile
+}
+
 Write-Log "[1/6] Configuring ESXi repository platforms and cleaning legacy depot URLs..."
 
 # Prune any stale or unreachable third-party URLs previously added to persistent config
